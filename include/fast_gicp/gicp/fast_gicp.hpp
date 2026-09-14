@@ -12,6 +12,8 @@
 #include <fast_gicp/gicp/lsq_registration.hpp>
 #include <fast_gicp/gicp/gicp_settings.hpp>
 #include <ctime>
+#include <fast_gicp/gicp/imu_preintegrator.hpp>
+#include <memory>
 
 namespace fast_gicp {
 
@@ -108,6 +110,22 @@ public:
   const std::vector<float>& getTargetScales() const {
   	// if (target_->size() * 3 != target_scales_.size()){ std::cerr << "target and quaternions size mismatch. Did you change target?"<<std::endl;}
     return target_scales_;}
+  
+    void set_imu_data(const IMUPreintegrator::Result& imu_result, 
+                    const Eigen::Isometry3d& T_prev) {
+    imu_result_ = std::make_shared<IMUPreintegrator::Result>(imu_result);
+    T_prev_ = T_prev;
+    imu_enabled_ = true;
+  }
+
+  void disable_imu() {
+    imu_enabled_ = false;
+    imu_result_ = nullptr;
+  }
+
+  bool is_imu_enabled() const {
+    return imu_enabled_;
+  }
 
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
@@ -116,6 +134,18 @@ protected:
 
   virtual double linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) override;
 
+  virtual double linearize(
+    const Eigen::Isometry3d& trans, 
+    Eigen::Matrix<double, 6, 6>* H, 
+    Eigen::Matrix<double, 6, 1>* b,
+    bool imu_enabled,
+    const IMUPreintegrator::Result* imu_result,
+    const Eigen::Isometry3d& T_prev);
+  
+  bool imu_enabled_ = false;
+  std::shared_ptr<IMUPreintegrator::Result> imu_result_ = nullptr;
+  Eigen::Isometry3d T_prev_ = Eigen::Isometry3d::Identity();
+    
   virtual double compute_error(const Eigen::Isometry3d& trans) override;
 
   template<typename PointT>

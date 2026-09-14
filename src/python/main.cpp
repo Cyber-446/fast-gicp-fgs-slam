@@ -8,6 +8,8 @@
 #include <fast_gicp/gicp/fast_gicp.hpp>
 #include <fast_gicp/gicp/fast_vgicp.hpp>
 
+#include <fast_gicp/gicp/imu_preintegrator.hpp>
+
 #ifdef USE_VGICP_CUDA
 #include <fast_gicp/ndt/ndt_cuda.hpp>
 #include <fast_gicp/gicp/fast_vgicp_cuda.hpp>
@@ -178,6 +180,64 @@ PYBIND11_MODULE(pygicp, m) {
       }, py::arg("initial_guess") = Eigen::Matrix4f::Identity()
     )
   ;
+
+  // ============================================
+    // Биндинг для IMUPreintegrator::Result
+    // ============================================
+    py::class_<IMUPreintegrator::Result, std::shared_ptr<IMUPreintegrator::Result>>(m, "ImuResult")
+        .def(py::init<>())
+        .def_readwrite("delta_R", &IMUPreintegrator::Result::delta_R)
+        .def_readwrite("delta_p_pose", &IMUPreintegrator::Result::delta_p_pose)
+        .def_readwrite("delta_v", &IMUPreintegrator::Result::delta_v)
+        .def_readwrite("covariance", &IMUPreintegrator::Result::covariance)
+        .def_readwrite("dt", &IMUPreintegrator::Result::dt)
+        .def_readwrite("v_i_world", &IMUPreintegrator::Result::v_i_world);
+
+    // ============================================
+    // Биндинг для IMUPreintegrator
+    // ============================================
+    py::class_<IMUPreintegrator, std::shared_ptr<IMUPreintegrator>>(m, "IMUPreintegrator")
+        .def(py::init<double, 
+                      const Eigen::Matrix3d&, 
+                      const Eigen::Matrix3d&, 
+                      const Eigen::Matrix3d&,
+                      const Eigen::Vector3d&,
+                      const Eigen::Vector3d&>(),
+             py::arg("gravity"),
+             py::arg("accel_cov"),
+             py::arg("gyro_cov"),
+             py::arg("integration_cov"),
+             py::arg("accel_bias") = Eigen::Vector3d::Zero(),
+             py::arg("gyro_bias") = Eigen::Vector3d::Zero())
+        
+        .def("set_state", &IMUPreintegrator::setState,
+             py::arg("R_i_world"), py::arg("v_i_world"))
+        
+        // Принимаем 7 чисел: [a_x, a_y, a_z, w_x, w_y, w_z, dt]
+        .def("integrate", [](IMUPreintegrator& self, const Eigen::VectorXd& imu_data) {
+            if (imu_data.size() != 7) {
+                throw std::invalid_argument("imu_data must have exactly 7 elements");
+            }
+            Eigen::Vector3d accel(imu_data(0), imu_data(1), imu_data(2));
+            Eigen::Vector3d gyro(imu_data(3), imu_data(4), imu_data(5));
+            double dt = imu_data(6);
+            self.integrate(accel, gyro, dt);
+        }, py::arg("imu_data"))
+        
+        .def("get_result", [](const IMUPreintegrator& self, py::object imu_delta) {
+            if (imu_delta.is_none()) {
+                return self.getResult(nullptr); // Передаем nullptr в C++, если в Python пришел None
+            }
+            // Конвертируем Python-объект в указатель на структуру C++
+            auto* ptr = imu_delta.cast<IMUPreintegrator::ImuDeltaData*>();
+            return self.getResult(ptr);
+        }, py::arg("imu_delta") = py::none()) // По умолчанию аргумент равен None
+
+                .def("finish_interval", &IMUPreintegrator::finishInterval)
+        .def("reset", &IMUPreintegrator::reset)
+        .def("velocity_world", &IMUPreintegrator::velocityWorld)
+        .def("rotation_world", &IMUPreintegrator::rotationWorld);
+        
   py::class_<FastGICP, LsqRegistration, std::shared_ptr<FastGICP>>(m, "FastGICP")
     .def(py::init())
     .def(py::pickle(
@@ -259,6 +319,16 @@ PYBIND11_MODULE(pygicp, m) {
       const auto input_filter = filter.cast<std::vector<int>>();
     	gicp.setTargetFilter(num_trackable, input_filter);
     })
+    .def("set_imu_data", [](fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ>& self,
+                        const IMUPreintegrator::Result& imu_result,
+                        const Eigen::Matrix4d& T_prev_matrix) {
+        // Конвертируем Matrix4d -> Isometry3d
+        Eigen::Isometry3d T_prev = Eigen::Isometry3d::Identity();
+        T_prev.matrix() = T_prev_matrix;
+        self.set_imu_data(imu_result, T_prev);
+    }, py::arg("imu_result"), py::arg("T_prev"))
+    .def("disable_imu", &fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ>::disable_imu)
+    .def("is_imu_enabled", &fast_gicp::FastGICP<pcl::PointXYZ, pcl::PointXYZ>::is_imu_enabled);
   ;
 
   py::class_<FastVGICP, FastGICP, std::shared_ptr<FastVGICP>>(m, "FastVGICP")

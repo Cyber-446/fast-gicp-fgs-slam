@@ -11,6 +11,7 @@ set(CMAKE_BUILD_TYPE "Release")
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 add_definitions(${PCL_DEFINITIONS})
+find_package(GTSAM REQUIRED)
 
 if(DEFINED ENV{ROS_VERSION})
   set(ROS_VERSION $ENV{ROS_VERSION})
@@ -79,6 +80,7 @@ if(BUILD_apps)
   target_link_libraries(gicp_align
     ${PCL_LIBRARIES}
     fast_gicp
+    gtsam
   )
 
   add_executable(gicp_kitti src/kitti.cpp)
@@ -86,12 +88,14 @@ if(BUILD_apps)
   target_link_libraries(gicp_kitti
     ${PCL_LIBRARIES}
     fast_gicp
+    gtsam
   )
 endif()
 
 ### Python bindings ###
 if(BUILD_PYTHON_BINDINGS)
-  add_subdirectory(thirdparty/pybind11)
+  #add_subdirectory(thirdparty/pybind11)
+  find_package(pybind11 REQUIRED)
   pybind11_add_module(pygicp
     src/python/main.cpp
   )
@@ -102,6 +106,7 @@ if(BUILD_PYTHON_BINDINGS)
   )
   target_link_libraries(pygicp PRIVATE
     fast_gicp
+    gtsam
   )
 endif()
 

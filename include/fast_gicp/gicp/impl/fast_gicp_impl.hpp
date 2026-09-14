@@ -2,6 +2,28 @@
 #define FAST_GICP_FAST_GICP_IMPL_HPP
 
 #include <fast_gicp/so3/so3.hpp>
+#include <fast_gicp/gicp/imu_preintegrator.hpp>
+
+namespace {
+
+// Преобразование матрицы поворота в вектор поворота (log map SO(3) -> R^3)
+inline Eigen::Vector3d so3_log(const Eigen::Matrix3d& R) {
+    Eigen::AngleAxisd aa(R);
+    return aa.angle() * aa.axis();
+}
+
+// Преобразование вектора поворота в матрицу поворота (exp map R^3 -> SO(3))
+inline Eigen::Matrix3d so3_exp(const Eigen::Vector3d& omega) {
+    double theta = omega.norm();
+    if (theta < 1e-10) {
+        return Eigen::Matrix3d::Identity();
+    }
+    Eigen::Vector3d axis = omega / theta;
+    Eigen::AngleAxisd aa(theta, axis);
+    return aa.toRotationMatrix();
+}
+
+} // anonymous namespace
 
 namespace fast_gicp {
 
@@ -296,6 +318,19 @@ template <typename PointSource, typename PointTarget, typename SearchMethodSourc
 double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) {
   update_correspondences(trans);
 
+  return linearize(trans, H, b, imu_enabled_, imu_result_.get(), T_prev_);
+}
+
+template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
+double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::linearize(
+    const Eigen::Isometry3d& trans, 
+    Eigen::Matrix<double, 6, 6>* H, 
+    Eigen::Matrix<double, 6, 1>* b,
+    bool imu_enabled,
+    const IMUPreintegrator::Result* imu_result,
+    const Eigen::Isometry3d& T_prev)  {
+update_correspondences(trans);
+
   double sum_errors = 0.0;
   std::vector<Eigen::Matrix<double, 6, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 6>>> Hs(num_threads_);
   std::vector<Eigen::Matrix<double, 6, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 1>>> bs(num_threads_);
@@ -303,6 +338,7 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     Hs[i].setZero();
     bs[i].setZero();
   }
+  double gicp_trust_factor = 1;
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
@@ -320,7 +356,7 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
     const Eigen::Vector4d error = mean_B - transed_mean_A;
 
-    sum_errors += error.transpose() * mahalanobis_[i] * error;
+    sum_errors += (gicp_trust_factor) * (error.transpose() * mahalanobis_[i] * error).value();
 
     if (H == nullptr || b == nullptr) {
       continue;
@@ -335,8 +371,8 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     Eigen::Matrix<double, 6, 6> Hi = jlossexp.transpose() * mahalanobis_[i] * jlossexp;
     Eigen::Matrix<double, 6, 1> bi = jlossexp.transpose() * mahalanobis_[i] * error;
 
-    Hs[omp_get_thread_num()] += Hi;
-    bs[omp_get_thread_num()] += bi;
+    Hs[omp_get_thread_num()] += gicp_trust_factor * Hi;
+    bs[omp_get_thread_num()] += gicp_trust_factor * bi;
   }
 
   if (H && b) {
@@ -346,6 +382,138 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
       (*H) += Hs[i];
       (*b) += bs[i];
     }
+  }
+
+  // ========================================
+  // IMU constraint
+  // ========================================
+
+  if (imu_enabled && imu_result != nullptr && H != nullptr && b != nullptr) {
+
+      // Preintegrated IMU
+      const Eigen::Matrix3d& R_imu =
+          imu_result->delta_R;
+
+      const Eigen::Vector3d& p_imu =
+          imu_result->delta_p_pose;
+
+      // ----------------------------------------
+      //  IMU residual
+      // ----------------------------------------
+
+      auto imu_residual =
+          [&](const Eigen::Isometry3d& T) {
+
+              Eigen::Isometry3d T_delta =
+                  T_prev.inverse() * T;
+
+              Eigen::Matrix3d R_delta =
+                  T_delta.rotation();
+
+              Eigen::Vector3d p_delta =
+                  T_delta.translation();
+
+              Eigen::Vector3d r_R =
+                  so3_log(R_imu.transpose() * R_delta);
+
+              Eigen::Vector3d r_p = p_delta - p_imu;
+
+              Eigen::Matrix<double, 6, 1> r;
+
+              r.head<3>() = r_R;
+              r.tail<3>() = r_p;
+
+              return r;
+          };
+
+      const Eigen::Matrix<double, 6, 1> r_imu =
+          imu_residual(trans);
+
+      // --------------------------------------------------------
+      // IMU covariance
+      // --------------------------------------------------------
+
+      const Eigen::Matrix<double, 6, 6> Sigma_imu =
+          imu_result->covariance.block<6, 6>(0, 0);
+
+      Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Sigma_imu);
+
+      const Eigen::Matrix<double, 6, 6> Omega_imu_raw =
+          ldlt.solve(Eigen::Matrix<double, 6, 6>::Identity());
+      const Eigen::Matrix<double, 6, 6> Omega_imu = Omega_imu_raw * 1.5e-8;
+
+      // ----------------------------------------
+      // Jacobian
+      // ----------------------------------------
+
+      Eigen::Matrix<double, 6, 6> J_imu =
+          Eigen::Matrix<double, 6, 6>::Zero();
+
+      const double eps_rot = 1e-6;
+      const double eps_trans = 1e-6;
+
+      for (int k = 0; k < 6; k++) {
+
+          Eigen::Matrix<double, 6, 1> delta;
+          delta.setZero();
+
+          const double eps =
+              (k < 3) ? eps_rot : eps_trans;
+
+          delta(k) = eps;
+
+          Eigen::Isometry3d T_perturbed =
+              Eigen::Isometry3d::Identity();
+
+          T_perturbed.linear() =
+              so3_exp(delta.head<3>())
+                  .toRotationMatrix();
+
+          T_perturbed.translation() =
+              delta.tail<3>();
+
+          T_perturbed =
+              T_perturbed * trans;
+
+          Eigen::Matrix<double, 6, 1> r_plus =
+              imu_residual(T_perturbed);
+
+          J_imu.col(k) =
+              (r_plus - r_imu) / eps;
+      }
+
+      // ----------------------------------------
+      // IMU Hessian
+      // ----------------------------------------
+
+      const Eigen::Matrix<double, 6, 6> H_imu =
+          J_imu.transpose() *
+          Omega_imu *
+          J_imu;
+
+      // ----------------------------------------
+      // IMU gradient
+      // ----------------------------------------
+
+      const Eigen::Matrix<double, 6, 1> b_imu =
+          J_imu.transpose() *
+          Omega_imu *
+          r_imu;
+
+      // ----------------------------------------
+      // Add to GICP
+      // ----------------------------------------
+
+      *H += H_imu;
+      *b += b_imu;
+
+      // add IMU cost
+      sum_errors +=
+          r_imu.transpose() *
+          Omega_imu *
+          r_imu;
+
+        
   }
 
   return sum_errors;
