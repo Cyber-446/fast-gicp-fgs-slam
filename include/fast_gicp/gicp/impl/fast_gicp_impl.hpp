@@ -316,8 +316,6 @@ void FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>:
 
 template <typename PointSource, typename PointTarget, typename SearchMethodSource, typename SearchMethodTarget>
 double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget>::linearize(const Eigen::Isometry3d& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b) {
-  update_correspondences(trans);
-
   return linearize(trans, H, b, imu_enabled_, imu_result_.get(), T_prev_);
 }
 
@@ -329,7 +327,7 @@ double FastGICP<PointSource, PointTarget, SearchMethodSource, SearchMethodTarget
     bool imu_enabled,
     const IMUPreintegrator::Result* imu_result,
     const Eigen::Isometry3d& T_prev)  {
-update_correspondences(trans);
+update_correspondences(trans); // поиск ближайших точек
 
   double sum_errors = 0.0;
   std::vector<Eigen::Matrix<double, 6, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 6, 6>>> Hs(num_threads_);
@@ -347,16 +345,16 @@ update_correspondences(trans);
       continue;
     }
 
-    const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>(); // точка входного облака (от нового кадра)
     const auto& cov_A = source_covs_[i];
 
-    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>(); // точка результирующего облака (от пред кадра)
     const auto& cov_B = target_covs_[target_index];
 
-    const Eigen::Vector4d transed_mean_A = trans * mean_A;
-    const Eigen::Vector4d error = mean_B - transed_mean_A;
+    const Eigen::Vector4d transed_mean_A = trans * mean_A; // применение трансформации
+    const Eigen::Vector4d error = mean_B - transed_mean_A; // отклонение при трансформации
 
-    sum_errors += (gicp_trust_factor) * (error.transpose() * mahalanobis_[i] * error).value();
+    sum_errors += (gicp_trust_factor) * (error.transpose() * mahalanobis_[i] * error).value(); // стоимость отклонения (расстояние Махаланобиса)
 
     if (H == nullptr || b == nullptr) {
       continue;
@@ -366,10 +364,10 @@ update_correspondences(trans);
     dtdx0.block<3, 3>(0, 0) = skewd(transed_mean_A.head<3>());
     dtdx0.block<3, 3>(0, 3) = -Eigen::Matrix3d::Identity();
 
-    Eigen::Matrix<double, 4, 6> jlossexp = dtdx0;
+    Eigen::Matrix<double, 4, 6> jlossexp = dtdx0; //якобиан
 
-    Eigen::Matrix<double, 6, 6> Hi = jlossexp.transpose() * mahalanobis_[i] * jlossexp;
-    Eigen::Matrix<double, 6, 1> bi = jlossexp.transpose() * mahalanobis_[i] * error;
+    Eigen::Matrix<double, 6, 6> Hi = jlossexp.transpose() * mahalanobis_[i] * jlossexp; // гессиан, содержит малые приращения положения и ориентации
+    Eigen::Matrix<double, 6, 1> bi = jlossexp.transpose() * mahalanobis_[i] * error; // градиент
 
     Hs[omp_get_thread_num()] += gicp_trust_factor * Hi;
     bs[omp_get_thread_num()] += gicp_trust_factor * bi;
@@ -386,16 +384,17 @@ update_correspondences(trans);
 
   // ========================================
   // IMU constraint
+  // нет в оригинальном fas gicp
   // ========================================
 
   if (imu_enabled && imu_result != nullptr && H != nullptr && b != nullptr) {
 
       // Preintegrated IMU
       const Eigen::Matrix3d& R_imu =
-          imu_result->delta_R;
+          imu_result->delta_R; // относительное вращение между 2 кадрами в ЛСК начального кадра
 
       const Eigen::Vector3d& p_imu =
-          imu_result->delta_p_pose;
+          imu_result->delta_p_pose; // относительное перемещение, аналогично вращению
 
       // ----------------------------------------
       //  IMU residual
@@ -405,7 +404,7 @@ update_correspondences(trans);
           [&](const Eigen::Isometry3d& T) {
 
               Eigen::Isometry3d T_delta =
-                  T_prev.inverse() * T;
+                  T_prev.inverse() * T; // перемещение между 2 кадрами в ЛСК пред кадра, полученное от GICP
 
               Eigen::Matrix3d R_delta =
                   T_delta.rotation();
@@ -414,9 +413,9 @@ update_correspondences(trans);
                   T_delta.translation();
 
               Eigen::Vector3d r_R =
-                  so3_log(R_imu.transpose() * R_delta);
+                  so3_log(R_imu.transpose() * R_delta); // отклонение относительного вращения по gicp от данных imu
 
-              Eigen::Vector3d r_p = p_delta - p_imu;
+              Eigen::Vector3d r_p = p_delta - p_imu; // отклонение относительного перемещения по gicp от данных imu
 
               Eigen::Matrix<double, 6, 1> r;
 
@@ -447,7 +446,7 @@ update_correspondences(trans);
       // ----------------------------------------
 
       Eigen::Matrix<double, 6, 6> J_imu =
-          Eigen::Matrix<double, 6, 6>::Zero();
+          Eigen::Matrix<double, 6, 6>::Zero(); // численный якобиан для вычисления гессиана и градиента
 
       const double eps_rot = 1e-6;
       const double eps_trans = 1e-6;
